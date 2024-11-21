@@ -1,0 +1,185 @@
+---
+# This configuration achieves high resilience and scalability for the `my-app` application by combining several key strategies:
+#
+# ## Overview
+# - **Pod Anti-Affinity** ensures that pods are spread across nodes to minimize the risk of a single point of failure, thus improving resilience.
+# - **Topology Spread Constraints** promote even distribution of pods across different zones, enhancing the application's availability and fault tolerance.
+# - **PodDisruptionBudget (PDB)** maintains high availability during planned disruptions by ensuring that no more than 1 pod is unavailable at any time.
+# - **Horizontal Pod Autoscaling (HPA) with KEDA** dynamically adjusts the number of running pods based on incoming traffic, ensuring scalability.
+# - The use of a **cooldown period** and a well-defined `maxReplicaCount` prevents rapid and uncontrolled scaling, providing stability and preventing resource overuse.
+#
+# ## Cluster Requirements
+# - **KEDA Installation**: KEDA must be installed and configured in the cluster for event-driven autoscaling.
+# - **Prometheus Monitoring**: Prometheus must be set up to collect metrics such as `http_requests_total` and be accessible by KEDA.
+# - **PodDisruptionBudget Support**: Ensure that the cluster supports the `policy/v1` API for PDB, which is supported in Kubernetes version 1.21 and later.
+# - **Consistent Labeling**: Proper labeling of pods (`deployment-name: my-app`) must be maintained across all components.
+# - **Node Autoscaler (Optional)**: A Node Autoscaler is recommended to automatically add nodes when additional capacity is required.
+# - **Zone-Aware Topology**: Nodes must be labeled appropriately to support topology spread across multiple zones.
+#
+# Together, these configurations create a balanced approach to availability, resilience, and scalability, suitable for environments with varying workloads.
+---
+# Source: my-app/deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  # This value represents the initial number of pods and the minimum number of pods allowed to be up and running.
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        deployment-name: my-app
+    spec:
+      affinity:
+        # This section ensures that pods with the label `deployment-name: my-app` are scheduled across different nodes.
+        # Using `requiredDuringSchedulingIgnoredDuringExecution` guarantees strict anti-affinity during pod scheduling,
+        # meaning that no two pods with the same label can be placed on the same node.
+        # This helps to improve resilience by minimizing the impact of a node failure.
+        # If the number of nodes is less than the number of requested pods, some pods will remain in a Pending state
+        # until sufficient nodes are available. If a NodeAutoscaler is configured, it may add more nodes to the cluster
+        # to accommodate the pending pods and satisfy the scheduling requirements.
+        podAntiAffinity:
+          # An alternative to `requiredDuringSchedulingIgnoredDuringExecution` is `preferredDuringSchedulingIgnoredDuringExecution`.
+          # The `preferred` policy is less strict, allowing Kubernetes to prioritize, but not strictly enforce, the anti-affinity rule.
+          # Use the `preferred` policy when you do not need pods to be strictly placed on different nodes, but prefer them to be.
+          # This is useful when balancing resilience with flexibility, as it allows scheduling to proceed even if ideal conditions
+          # cannot be met, which is beneficial when resources are limited or during scaling operations.
+          # On the other hand, use `required` when it is critical that pods do not run on the same node, such as when ensuring high availability.
+          # In scenarios where a NodeAutoscaler is configured, with the `preferred` policy, the autoscaler may not always add new nodes
+          # as the system allows some flexibility in scheduling. However, with the `required` policy, the NodeAutoscaler will be more likely
+          # to add nodes to satisfy the strict anti-affinity requirement, ensuring that pods are scheduled on separate nodes.
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: deployment-name
+                operator: In
+                values:
+                - my-app
+            topologyKey: "kubernetes.io/hostname"
+      topologySpreadConstraints:
+        # This section ensures that the pods are distributed as evenly as possible across different failure domains.
+        # The following `topologySpreadConstraints` are used to maximize the distribution of pods across both Availability Domains (ADs)
+        # and Fault Domains (FDs) in Oracle Cloud Infrastructure (OCI), providing high resilience against both datacenter-level and hardware-level failures.
+        #
+        # The first constraint ensures that pods are distributed across different Availability Domains, providing datacenter-level resilience.
+      - maxSkew: 1
+        # Spread pods across different Availability Domains (ADs)
+        topologyKey: "topology.kubernetes.io/zone"
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            deployment-name: my-app
+        # The second constraint ensures that pods are distributed across different Fault Domains within an AD, reducing the risk of hardware failure.
+      - maxSkew: 1
+        # Spread pods across different Fault Domains (FDs) within an AD
+        topologyKey: "oci.oraclecloud.com/fault-domain"
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            deployment-name: my-app
+---
+# Source: my-app/pdb.yaml
+#
+# A PodDisruptionBudget (PDB) helps maintain application availability by ensuring that a maximum number of pods
+# can be unavailable during voluntary disruptions, such as maintenance, updates, or pods rebalancing.
+# This is crucial for guaranteeing the application availability during disruptions.
+# It is crucial to define a PDB to guarantee that the service remains functional, especially during rolling updates
+# or manual interventions.
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  # It is a good practice to name the PDB the same as the Deployment to easily identify their relationship.
+  name: my-app
+spec:
+  selector:
+    matchLabels:
+      deployment-name: my-app
+  # In this case, it ensures that no more than 1 pod is unavailable, which works well in combination with
+  # anti-affinity rules to maintain both availability and proper distribution across nodes.
+  # It is important to ensure that the `maxUnavailable` value does not exceed the number of replicas defined in the Deployment.
+  # If `maxUnavailable` is greater than the number of replicas, the PDB becomes invalid, which can lead to errors or unexpected behavior.
+  # This is particularly important when modifying the number of replicas in the Deployment, especially when using autoscaling.
+  # When autoscaling is used, ensure that `maxUnavailable` is adjusted accordingly to always stay within a valid range relative to the current replica count.
+  maxUnavailable: 1
+---
+# Source: my-app/scaler.yaml
+#
+# Horizontal Pod Autoscaler using KEDA based on Prometheus metrics
+# This configuration allows scaling the `my-app` deployment based on the HTTP request rate as observed in Prometheus.
+# If the average number of requests exceeds 50 over a two-minute period, it will trigger scaling up to a maximum of 10 replicas.
+# It is a good practice to set a `maxReplicaCount` that is higher than the expected load to prevent unexpected scaling out of control.
+# The PDB configuration ensures that at least 1 replica is available, allowing for consistent scaling behavior and high availability.
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  # It is a good practice to name the ScaledObject the same as the Deployment to easily identify their relationship.
+  name: my-app
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: my-app
+  # It is a good practice to align `minReplicaCount` with the `replicas` value in the Deployment to ensure consistency in availability.
+  # `minReplicaCount` represents the minimum number of pods that should always be running, which in this case is the same as the initial number of pods (`replicas`).
+  minReplicaCount: 2
+  # It is recommended to set a `maxReplicaCount` that is higher than expected load to prevent unexpected scaling out of control.
+  maxReplicaCount: 10
+  # Cooldown period to avoid rapid scaling up and down
+  # The cooldown period is an interval of time set to prevent the autoscaler from reacting too quickly to fluctuations in workload.
+  # This helps to avoid continuous up and down scaling actions (scaling at a yo-yo effect) that can result in system instability.
+  # In this configuration, a cooldown period of 30 seconds ensures that after a scaling event, the system will wait 30 seconds
+  # before evaluating the metrics again and potentially initiating another scaling action. This provides stability and prevents
+  # unnecessary resource allocation due to temporary spikes.
+  cooldownPeriod: 30
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-server.default.svc.cluster.local
+      metricName: http_requests_total
+      # This query captures the average rate of incoming HTTP requests (`http_requests_total`) over the past two minutes,
+      # aggregated by deployment. It provides an indication of the traffic load on each deployment, which is then used
+      # to decide whether scaling is necessary.
+      query: sum(rate(http_requests_total[2m])) by (deployment)
+      # `threshold` specifies the value at which scaling will be triggered.
+      # In this case, if the average number of incoming HTTP requests exceeds 50, KEDA will initiate the scale-out process to handle the increased load.
+      # Scale-out happens when the load increases and exceeds the threshold, adding more pods to handle the traffic.
+      threshold: "50"
+      # `activationThreshold` represents the minimum load required to activate the autoscaler.
+      # If the average number of incoming HTTP requests exceeds 20, KEDA will activate and start monitoring for potential scaling actions.
+      # Once activated, KEDA will determine whether to scale out or in based on the `threshold` and current workload.
+      # Scale-in happens when the load falls significantly below the threshold, allowing for a reduction in the number of pods to optimize resource usage.
+      activationThreshold: "20"
+---
+# Source: my-app/prometheus.yaml
+#
+# This configuration creates a dedicated Prometheus instance for the `my-app` microservice, managed by Prometheus Operator.
+# The Prometheus instance runs in-memory, without persistent storage, and has a retention period that is sufficient for autoscaling and alerting needs.
+# It also forwards metrics to a centralized system for long-term storage and cross-service aggregation.
+
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  # It is a good practice to name the Prometheus instance the same as the Deployment to easily identify their relationship.
+  name: my-app
+  labels:
+    deployment-name: my-app
+spec:
+  replicas: 1
+  retention: 30m
+  storage: {}
+  scrapeInterval: 10s
+  serviceMonitorSelector:
+    matchLabels:
+      deployment-name: my-app
+  resources:
+    requests:
+      memory: 200Mi
+      cpu: 100m
+    limits:
+      memory: 200Mi
+      cpu: 100m
+  remoteWrite:
+  - url: http://centralized-prometheus.default.svc.cluster.local/api/v1/write
