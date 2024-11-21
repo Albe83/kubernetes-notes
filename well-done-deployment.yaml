@@ -122,12 +122,15 @@ metadata:
 spec:
   # The value of `replicas` is set to 1 because this Prometheus instance is meant to be lightweight and dedicated to each microservice, operating in-memory for rapid responsiveness. This setup ensures minimal resource consumption while still providing sufficient metrics for KEDA to function effectively. Additionally, the choice of a single replica is acceptable since a temporary fault in metrics collection does not critically affect the overall application availability.
   replicas: 1
-  retention: 10m
-  storage: {}
-  scrapeInterval: 10s
+  # This Prometheus instance is minimal and designed to scrape metrics only from the pods of a single microservice.
   podMonitorSelector:
     matchLabels:
       deployment-name: my-app
+  # It is not necessary to retain the data longer than needed for KEDA, as a copy of the metrics is sent to an external Prometheus.
+  retention: 10m
+  storage: {}
+  scrapeInterval: 10s
+  # Mininal resources requesting
   resources:
     requests:
       memory: 100Mi
@@ -135,7 +138,8 @@ spec:
     limits:
       memory: 256Mi
   remoteWrite:
-  - url: http://centralized-prometheus.default.svc.cluster.local/api/v1/write
+  # Configure a remote Prometheus for long term storage and cross-service aggregation
+  - url: https://...
 ---
 # Source: my-app/monitor.yaml
 #
