@@ -41,7 +41,7 @@ spec:
         # until sufficient nodes are available. If a NodeAutoscaler is configured, it may add more nodes to the cluster
         # to accommodate the pending pods and satisfy the scheduling requirements.
         podAntiAffinity:
-          # An alternative to `requiredDuringSchedulingIgnoredDuringExecution` is `preferredDuringSchedulingIgnoredDuringExecution`.
+          # An alternative to `preferredDuringSchedulingIgnoredDuringExecution` is `requiredDuringSchedulingIgnoredDuringExecution`.
           # The `preferred` policy is less strict, allowing Kubernetes to prioritize, but not strictly enforce, the anti-affinity rule.
           # Use the `preferred` policy when you do not need pods to be strictly placed on different nodes, but prefer them to be.
           # This is useful when balancing resilience with flexibility, as it allows scheduling to proceed even if ideal conditions
@@ -104,6 +104,59 @@ spec:
   # This is particularly important when modifying the number of replicas in the Deployment, especially when using autoscaling.
   # When autoscaling is used, ensure that `maxUnavailable` is adjusted accordingly to always stay within a valid range relative to the current replica count.
   maxUnavailable: 1
+
+---
+# Source: my-app/prometheus.yaml
+#
+# This configuration creates a dedicated Prometheus instance for the `my-app` microservice, managed by Prometheus Operator.
+# The Prometheus instance runs in-memory, without persistent storage, and has a retention period that is sufficient for autoscaling and alerting needs.
+# It also forwards metrics to a centralized system for long-term storage and cross-service aggregation.
+
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  # It is a good practice to name the Prometheus instance the same as the Deployment to easily identify their relationship.
+  name: my-app
+  labels:
+    deployment-name: my-app
+spec:
+  # The value of `replicas` is set to 1 because this Prometheus instance is meant to be lightweight and dedicated to each microservice, operating in-memory for rapid responsiveness. This setup ensures minimal resource consumption while still providing sufficient metrics for KEDA to function effectively. Additionally, the choice of a single replica is acceptable since a temporary fault in metrics collection does not critically affect the overall application availability.
+  replicas: 1
+  retention: 10m
+  storage: {}
+  scrapeInterval: 10s
+  podMonitorSelector:
+    matchLabels:
+      deployment-name: my-app
+  resources:
+    requests:
+      memory: 100Mi
+      cpu: 100m
+    limits:
+      memory: 256Mi
+  remoteWrite:
+  - url: http://centralized-prometheus.default.svc.cluster.local/api/v1/write
+---
+# Source: my-app/monitor.yaml
+#
+# This PodMonitor configuration allows Prometheus to scrape metrics from the `my-app` pods directly.
+# It ensures that Prometheus collects metrics from pods with the label `deployment-name: my-app`, and that metrics are gathered every 10 seconds.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  # It is a good practice to name the PodMonitor the same as the Deployment to easily identify their relationship.
+  name: my-app
+  labels:
+    deployment-name: my-app
+spec:
+  selector:
+    matchLabels:
+      deployment-name: my-app
+  podMetricsEndpoints:
+  - port: web
+    interval: 10s
+    path: /metrics
 ---
 # Source: my-app/scaler.yaml
 #
@@ -152,34 +205,3 @@ spec:
       # Once activated, KEDA will determine whether to scale out or in based on the `threshold` and current workload.
       # Scale-in happens when the load falls significantly below the threshold, allowing for a reduction in the number of pods to optimize resource usage.
       activationThreshold: "20"
----
-# Source: my-app/prometheus.yaml
-#
-# This configuration creates a dedicated Prometheus instance for the `my-app` microservice, managed by Prometheus Operator.
-# The Prometheus instance runs in-memory, without persistent storage, and has a retention period that is sufficient for autoscaling and alerting needs.
-# It also forwards metrics to a centralized system for long-term storage and cross-service aggregation.
-
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
-metadata:
-  # It is a good practice to name the Prometheus instance the same as the Deployment to easily identify their relationship.
-  name: my-app
-  labels:
-    deployment-name: my-app
-spec:
-  replicas: 1
-  retention: 30m
-  storage: {}
-  scrapeInterval: 10s
-  serviceMonitorSelector:
-    matchLabels:
-      deployment-name: my-app
-  resources:
-    requests:
-      memory: 200Mi
-      cpu: 100m
-    limits:
-      memory: 200Mi
-      cpu: 100m
-  remoteWrite:
-  - url: http://centralized-prometheus.default.svc.cluster.local/api/v1/write
